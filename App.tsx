@@ -14,9 +14,18 @@ const App: React.FC = () => {
 
   const handleSubmit = useCallback(async (submittedUrl: string) => {
     if (!submittedUrl) {
-      setError('Vui lòng nhập một URL hợp lệ.');
+      setError('Vui lòng nhập một URL.');
       return;
     }
+    
+    // Client-side URL validation for immediate feedback
+    try {
+      new URL(submittedUrl);
+    } catch (_) {
+      setError('URL không hợp lệ. Vui lòng kiểm tra lại định dạng (ví dụ: https://example.com).');
+      return;
+    }
+
     setUrl(submittedUrl);
     setIsLoading(true);
     setError(null);
@@ -25,13 +34,9 @@ const App: React.FC = () => {
 
     try {
       const feed = await generateRssFromUrl(submittedUrl);
-      if (feed.trim().startsWith('<?xml')) {
-        setRssFeed(feed);
-        const fullFeedUrl = `${window.location.origin}/.netlify/functions/generate-rss?url=${encodeURIComponent(submittedUrl)}`;
-        setFeedUrl(fullFeedUrl);
-      } else {
-        throw new Error('Phản hồi từ AI không phải là một XML hợp lệ.');
-      }
+      setRssFeed(feed);
+      const fullFeedUrl = `${window.location.origin}/.netlify/functions/generate-rss?url=${encodeURIComponent(submittedUrl)}`;
+      setFeedUrl(fullFeedUrl);
     } catch (e) {
       console.error(e);
       const errorMessage = e instanceof Error ? e.message : 'Đã xảy ra lỗi không xác định.';
