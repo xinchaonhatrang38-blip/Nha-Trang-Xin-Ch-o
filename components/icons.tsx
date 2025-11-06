@@ -1,4 +1,3 @@
-
 import React from 'react';
 
 export const CopyIcon = (props: React.SVGProps<SVGSVGElement>) => (

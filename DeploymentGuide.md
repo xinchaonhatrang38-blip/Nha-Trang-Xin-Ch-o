@@ -19,6 +19,8 @@ Netlify sẽ tự động đọc file `netlify.toml` và điền sẵn các thô
 - **Build command:** `npm run build`
 - **Publish directory:** `dist`
 
+Nếu các thông số này chưa đúng, hãy chắc chắn bạn đã commit file `netlify.toml` lên repository.
+
 ### 4. Thêm API Key (QUAN TRỌNG)
 
 Đây là bước quan trọng nhất để bảo mật API Key.
