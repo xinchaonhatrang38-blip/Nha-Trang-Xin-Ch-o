@@ -1,0 +1,5 @@
+{
+  "name": "AI RSS Feed Generator",
+  "description": "An application that takes any news or blog URL and uses AI to automatically generate an RSS feed from its content.",
+  "requestFramePermissions": []
+}

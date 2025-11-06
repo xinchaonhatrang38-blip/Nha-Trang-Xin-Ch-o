@@ -1,0 +1,21 @@
+{
+  "name": "ai-rss-feed-generator",
+  "version": "1.0.0",
+  "description": "An application that takes any news or blog URL and uses AI to automatically generate an RSS feed from its content.",
+  "private": true,
+  "scripts": {
+    "build": "mkdir -p dist && cp index.html dist/ && esbuild index.tsx --bundle --outfile=dist/main.js --minify --sourcemap"
+  },
+  "dependencies": {
+    "@google/genai": "^1.29.0",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "@netlify/functions": "^2.0.0",
+    "@types/react": "^18.0.0",
+    "@types/react-dom": "^18.0.0",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.0.0"
+  }
+}
