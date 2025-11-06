@@ -1,94 +1,127 @@
+import type { Handler, HandlerEvent, HandlerContext } from "@netlify/functions";
 import { GoogleGenAI } from "@google/genai";
-import type { Handler, HandlerEvent } from "@netlify/functions";
 
-const API_KEY = process.env.API_KEY;
+// Helper function to return a structured error, which the frontend expects.
+const createErrorResponse = (message: string, statusCode: number = 500) => {
+  // The frontend code in `geminiService.ts` specifically looks for this format.
+  return {
+    statusCode,
+    headers: { 'Content-Type': 'application/xml' },
+    body: `<error><message>${message}</message></error>`,
+  };
+};
 
-if (!API_KEY) {
-  // This error is for the developer/deployer, not the end user.
-  throw new Error("API_KEY environment variable not set");
-}
+const handler: Handler = async (event: HandlerEvent, context: HandlerContext) => {
+  if (event.httpMethod !== 'GET') {
+    return { 
+      statusCode: 405, 
+      body: 'Method Not Allowed' 
+    };
+  }
 
-const ai = new GoogleGenAI({ apiKey: API_KEY });
-
-const handler: Handler = async (event: HandlerEvent) => {
-  const url = event.queryStringParameters?.url;
+  const { url } = event.queryStringParameters || {};
 
   if (!url) {
-    return {
-      statusCode: 400,
-      body: "Error: URL query parameter is required.",
-    };
+    return createErrorResponse("URL parameter is missing.", 400);
   }
 
-  // Server-side URL validation
+  let decodedUrl: string;
   try {
-    new URL(url);
-  } catch (_) {
-    return {
-      statusCode: 400,
-      body: "Error: Invalid URL format provided.",
-    };
+    decodedUrl = decodeURIComponent(url);
+    // Basic URL validation. The URL constructor will throw if it's invalid.
+    new URL(decodedUrl);
+  } catch (error) {
+    return createErrorResponse("Invalid URL format provided.", 400);
   }
-  
-  const siteOrigin = new URL(url).origin;
-
-  const prompt = `
-    You are an expert web scraper and RSS feed generator. Your task is to analyze the content of the given URL and generate a valid RSS 2.0 feed in XML format.
-
-    Given the URL: "${url}"
-
-    Please perform the following steps:
-    1. Identify the main list of articles on the page. Look for common HTML patterns like <article>, .post-item, .story-item, etc.
-    2. For each article, extract the following information:
-      - Title of the article.
-      - A direct link (href). Ensure this is a full URL. If you find a relative path like '/path/to/article', prepend it with the site's origin: '${siteOrigin}'.
-      - A short description or summary.
-      - A thumbnail image URL. Make sure it's a full URL.
-      - A publication date. Format it as a valid RFC 822 date (e.g., Wed, 02 Oct 2002 15:00:00 GMT). If no date is found, use the current date.
-    3. Construct a valid RSS 2.0 XML document. The feed should have a main <channel> with a title (e.g., "RSS Feed for ${url}"), link (the original URL), and a suitable description.
-    4. Each article should be an <item> inside the channel. Include <title>, <link>, <description>, <pubDate>, and <guid>. Use the article link for the <guid>. Enclose the description in <![CDATA[]]> if it contains HTML.
-    5. Generate between 5 to 10 <item> entries.
-    
-    **CRITICAL ERROR HANDLING RULES:**
-    - If you cannot access the URL, cannot parse the HTML, or cannot find any articles, DO NOT generate a sample RSS feed.
-    - Instead, your entire output MUST be a single XML element in the following format:
-      <error>
-        <message>A user-friendly error message explaining the problem (e.g., 'Could not access the provided URL.' or 'No articles were found on this page.')</message>
-      </error>
-    - This <error> block is the ONLY thing you should return in case of a failure.
-    
-    **OUTPUT FORMAT RULES:**
-    - If successful, your output MUST be only the raw XML content. 
-    - Start your response directly with \`<?xml version="1.0" encoding="UTF-8" ?>\`.
-    - Do not include any explanations, comments, or markdown fences like \`\`\`xml.
-  `;
 
   try {
-    const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
+    // 1. Fetch the HTML content of the target URL.
+    // Set a reasonable timeout to prevent long-running functions.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 seconds
+    
+    const response = await fetch(decodedUrl, { signal: controller.signal });
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      return createErrorResponse(`Failed to fetch the URL. Server responded with status: ${response.status}`, 502);
+    }
+    const htmlContent = await response.text();
+
+    // 2. Initialize Gemini API
+    const apiKey = process.env.API_KEY;
+    if (!apiKey) {
+      // This is a server configuration error, so we log it and return a generic error to the user.
+      console.error("API_KEY environment variable is not set.");
+      return createErrorResponse("Server configuration error. Unable to process request.", 500);
+    }
+    // Correct initialization following the guidelines.
+    const ai = new GoogleGenAI({ apiKey });
+
+    // 3. Construct the prompt for Gemini.
+    const prompt = `
+      You are an expert AI that converts a news or blog website's HTML into a valid RSS 2.0 feed.
+      Analyze the following HTML from the URL: ${decodedUrl}
+      Your task is to generate a complete and valid RSS 2.0 XML feed.
+
+      **Instructions:**
+      1.  The output MUST be only the raw XML content, starting with \`<?xml version="1.0" encoding="UTF-8" ?>\`. Do not add any other text, markdown, or explanations.
+      2.  Create a \`<channel>\` with:
+          - \`<title>\`: The main title of the website.
+          - \`<link>\`: The original URL: ${decodedUrl}
+          - \`<description>\`: A brief summary of the website's purpose.
+          - \`<language>\`: Infer the language from the content (e.g., 'vi-vn' for Vietnamese, 'en-us' for English).
+          - \`<lastBuildDate>\`: The current date and time in RFC 822 format.
+      3.  Create multiple \`<item>\` elements for each article found on the page (target 5-15 items). Each \`<item>\` must have:
+          - \`<title>\`: The article's headline.
+          - \`<link>\`: The absolute URL to the full article. If you find a relative URL (e.g., "/path/to/article"), prepend it with "${new URL(decodedUrl).origin}".
+          - \`<description>\`: A concise summary or the beginning of the article content.
+          - \`<pubDate>\`: The publication date in RFC 822 format (e.g., "Wed, 02 Oct 2002 13:00:00 GMT"). If a date is not found, you can omit this tag for the item.
+
+      **Error Handling:**
+      -   If you cannot process the HTML or determine it's not a news/blog page, you MUST return a response containing ONLY the following XML structure:
+          \`<error><message>The AI could not process the provided URL. It may not be a valid news or blog page.</message></error>\`
+
+      **HTML Content to Analyze:**
+      \`\`\`html
+      ${htmlContent}
+      \`\`\`
+    `;
+
+    // 4. Generate content using the Gemini API.
+    const geminiResponse = await ai.models.generateContent({
+        model: "gemini-2.5-flash", // A good balance of speed and capability for this task.
         contents: prompt,
     });
-    const resultText = response.text;
+    
+    // 5. Extract and validate the response.
+    const rssFeed = geminiResponse.text.trim();
+    
+    if (!rssFeed) {
+        return createErrorResponse("The AI returned an empty response.", 500);
+    }
 
-    // The backend should still respect the content type for the client
+    // The frontend expects either an <error> tag or a valid XML feed.
+    // If the AI followed instructions for an error, we pass it through.
+    // Otherwise, we ensure it looks like a valid RSS feed.
+    if (!rssFeed.startsWith('<error>') && !rssFeed.startsWith('<?xml')) {
+        console.error("AI response did not conform to the expected format. Response:", rssFeed);
+        return createErrorResponse("The AI returned a response in an unexpected format.", 500);
+    }
+
+
     return {
       statusCode: 200,
       headers: {
         "Content-Type": "application/xml; charset=utf-8",
       },
-      body: resultText,
+      body: rssFeed,
     };
+
   } catch (error) {
-    console.error("Error calling Gemini API:", error);
-    // Return a generic server error if the API call itself fails
-    const errorXml = `<error><message>An internal error occurred while contacting the AI service.</message></error>`;
-    return {
-      statusCode: 500,
-      headers: {
-        "Content-Type": "application/xml; charset=utf-8",
-      },
-      body: errorXml,
-    };
+    console.error("Error in generate-rss function:", error);
+    const errorMessage = error instanceof Error ? error.message : "An unknown internal error occurred.";
+    return createErrorResponse(`Failed to generate RSS feed. ${errorMessage}`, 500);
   }
 };
 
