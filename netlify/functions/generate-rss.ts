@@ -1,22 +1,30 @@
-import type { Handler, HandlerEvent, HandlerContext } from "@netlify/functions";
+import type { Handler, HandlerEvent } from "@netlify/functions";
 import { GoogleGenAI } from "@google/genai";
+import axios from 'axios';
 
-// Helper function to return a structured error, which the frontend expects.
+// --- Caching Layer ---
+// This simple in-memory cache helps reduce redundant API calls for the same URL.
+// It's effective within the lifecycle of a single serverless function instance.
+interface CacheEntry {
+  timestamp: number;
+  data: string;
+}
+const cache = new Map<string, CacheEntry>();
+const CACHE_DURATION_MS = 10 * 60 * 1000; // 10 minutes
+
+// --- Helper Functions ---
 const createErrorResponse = (message: string, statusCode: number = 500) => {
-  // The frontend code in `geminiService.ts` specifically looks for this format.
   return {
     statusCode,
-    headers: { 'Content-Type': 'application/xml' },
+    headers: { 'Content-Type': 'application/xml; charset=utf-8' },
     body: `<error><message>${message}</message></error>`,
   };
 };
 
-const handler: Handler = async (event: HandlerEvent, context: HandlerContext) => {
+// --- Main Handler ---
+const handler: Handler = async (event: HandlerEvent) => {
   if (event.httpMethod !== 'GET') {
-    return { 
-      statusCode: 405, 
-      body: 'Method Not Allowed' 
-    };
+    return { statusCode: 405, body: 'Method Not Allowed' };
   }
 
   const { url } = event.queryStringParameters || {};
@@ -28,37 +36,40 @@ const handler: Handler = async (event: HandlerEvent, context: HandlerContext) =>
   let decodedUrl: string;
   try {
     decodedUrl = decodeURIComponent(url);
-    // Basic URL validation. The URL constructor will throw if it's invalid.
     new URL(decodedUrl);
   } catch (error) {
     return createErrorResponse("Invalid URL format provided.", 400);
   }
 
-  try {
-    // 1. Fetch the HTML content of the target URL.
-    // Set a reasonable timeout to prevent long-running functions.
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 seconds
-    
-    const response = await fetch(decodedUrl, { signal: controller.signal });
-    clearTimeout(timeoutId);
+  // Check cache first
+  const cachedItem = cache.get(decodedUrl);
+  if (cachedItem && Date.now() - cachedItem.timestamp < CACHE_DURATION_MS) {
+    return {
+      statusCode: 200,
+      headers: { 'Content-Type': 'application/xml; charset=utf-8', 'X-Cache': 'HIT' },
+      body: cachedItem.data,
+    };
+  }
 
-    if (!response.ok) {
-      return createErrorResponse(`Failed to fetch the URL. Server responded with status: ${response.status}`, 502);
-    }
-    const htmlContent = await response.text();
+  try {
+    // 1. Fetch HTML content more reliably using axios
+    const { data: htmlContent } = await axios.get(decodedUrl, {
+      timeout: 15000, // 15-second timeout
+      headers: {
+        // Use a common browser User-Agent to avoid being blocked
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+      },
+    });
 
     // 2. Initialize Gemini API
     const apiKey = process.env.API_KEY;
     if (!apiKey) {
-      // This is a server configuration error, so we log it and return a generic error to the user.
       console.error("API_KEY environment variable is not set.");
-      return createErrorResponse("Server configuration error. Unable to process request.", 500);
+      return createErrorResponse("Server configuration error.", 500);
     }
-    // Correct initialization following the guidelines.
     const ai = new GoogleGenAI({ apiKey });
 
-    // 3. Construct the prompt for Gemini.
+    // 3. Construct the prompt for Gemini
     const prompt = `
       You are an expert AI that converts a news or blog website's HTML into a valid RSS 2.0 feed.
       Analyze the following HTML from the URL: ${decodedUrl}
@@ -66,21 +77,12 @@ const handler: Handler = async (event: HandlerEvent, context: HandlerContext) =>
 
       **Instructions:**
       1.  The output MUST be only the raw XML content, starting with \`<?xml version="1.0" encoding="UTF-8" ?>\`. Do not add any other text, markdown, or explanations.
-      2.  Create a \`<channel>\` with:
-          - \`<title>\`: The main title of the website.
-          - \`<link>\`: The original URL: ${decodedUrl}
-          - \`<description>\`: A brief summary of the website's purpose.
-          - \`<language>\`: Infer the language from the content (e.g., 'vi-vn' for Vietnamese, 'en-us' for English).
-          - \`<lastBuildDate>\`: The current date and time in RFC 822 format.
-      3.  Create multiple \`<item>\` elements for each article found on the page (target 5-15 items). Each \`<item>\` must have:
-          - \`<title>\`: The article's headline.
-          - \`<link>\`: The absolute URL to the full article. If you find a relative URL (e.g., "/path/to/article"), prepend it with "${new URL(decodedUrl).origin}".
-          - \`<description>\`: A concise summary or the beginning of the article content.
-          - \`<pubDate>\`: The publication date in RFC 822 format (e.g., "Wed, 02 Oct 2002 13:00:00 GMT"). If a date is not found, you can omit this tag for the item.
+      2.  Create a \`<channel>\` with appropriate \`<title>\`, \`<link>\`, \`<description>\`, \`<language>\`, and \`<lastBuildDate>\`.
+      3.  Create multiple \`<item>\` elements for each article (target 5-15 items). Each must have \`<title>\`, \`<link>\` (absolute URL), \`<description>\`, and optionally \`<pubDate>\`.
 
       **Error Handling:**
-      -   If you cannot process the HTML or determine it's not a news/blog page, you MUST return a response containing ONLY the following XML structure:
-          \`<error><message>The AI could not process the provided URL. It may not be a valid news or blog page.</message></error>\`
+      -   If you cannot process the HTML or find any articles, you MUST return a response containing ONLY the following XML structure:
+          \`<error><message>The AI could not find any articles on the provided URL. It may not be a valid news or blog page.</message></error>\`
 
       **HTML Content to Analyze:**
       \`\`\`html
@@ -88,40 +90,48 @@ const handler: Handler = async (event: HandlerEvent, context: HandlerContext) =>
       \`\`\`
     `;
 
-    // 4. Generate content using the Gemini API.
+    // 4. Generate content
     const geminiResponse = await ai.models.generateContent({
-        model: "gemini-2.5-flash", // A good balance of speed and capability for this task.
+        model: "gemini-2.5-flash",
         contents: prompt,
     });
     
-    // 5. Extract and validate the response.
+    // 5. Extract and validate the response
     const rssFeed = geminiResponse.text.trim();
     
     if (!rssFeed) {
         return createErrorResponse("The AI returned an empty response.", 500);
     }
 
-    // The frontend expects either an <error> tag or a valid XML feed.
-    // If the AI followed instructions for an error, we pass it through.
-    // Otherwise, we ensure it looks like a valid RSS feed.
-    if (!rssFeed.startsWith('<error>') && !rssFeed.startsWith('<?xml')) {
-        console.error("AI response did not conform to the expected format. Response:", rssFeed);
+    if (rssFeed.startsWith('<error>')) {
+        // This is a valid error response from the AI, pass it through but don't cache it.
+        return {
+            statusCode: 200, // The function worked, but AI couldn't find content
+            headers: { 'Content-Type': 'application/xml; charset=utf-8' },
+            body: rssFeed,
+        };
+    }
+
+    if (!rssFeed.startsWith('<?xml')) {
+        console.error("AI response did not conform to the expected XML format. Response:", rssFeed);
         return createErrorResponse("The AI returned a response in an unexpected format.", 500);
     }
 
+    // Cache the successful result
+    cache.set(decodedUrl, { timestamp: Date.now(), data: rssFeed });
 
     return {
       statusCode: 200,
-      headers: {
-        "Content-Type": "application/xml; charset=utf-8",
-      },
+      headers: { 'Content-Type': 'application/xml; charset=utf-8', 'X-Cache': 'MISS' },
       body: rssFeed,
     };
 
   } catch (error) {
     console.error("Error in generate-rss function:", error);
-    const errorMessage = error instanceof Error ? error.message : "An unknown internal error occurred.";
-    return createErrorResponse(`Failed to generate RSS feed. ${errorMessage}`, 500);
+    const errorMessage = axios.isAxiosError(error) 
+        ? `Failed to fetch URL: ${error.message}` 
+        : (error instanceof Error ? error.message : "An unknown internal error occurred.");
+    return createErrorResponse(errorMessage, 500);
   }
 };
 
